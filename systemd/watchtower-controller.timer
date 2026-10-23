@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Central Watchtower Controller daily
+
+[Timer]
+OnCalendar=*-*-* 07:00:00
+Persistent=true
+AccuracySec=1min
+Unit=watchtower-controller.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,17 @@
+# Watchtower Controller hosts
+#
+# Format: name|docker_host|enabled[|tls_dir]
+#
+#   name         Letters, digits, ".", "_" and "-". Used in the container name,
+#                the state file and the notification title.
+#   docker_host  unix:///var/run/docker.sock  (the controller host itself)
+#                tcp://host:2376              (remote, with tls_dir: recommended)
+#                tcp://host:2375              (remote, no TLS: trusted LAN only)
+#   enabled      true to process the host, anything else to skip it.
+#   tls_dir      Optional. Directory on the controller host holding ca.pem,
+#                cert.pem and key.pem of a client certificate trusted by the
+#                remote Docker daemon. Mounted read-only into Watchtower.
+
+docker-main|unix:///var/run/docker.sock|true
+docker02|tcp://docker02.example.com:2376|true|/opt/watchtower-controller/certs/docker02
+nas|tcp://nas.example.com:2376|false|/opt/watchtower-controller/certs/nas

@@ -1,0 +1,592 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+# -----------------------------------------------------------------------------
+# Watchtower Controller
+#
+# Centralized Watchtower runner for multiple Docker hosts.
+#
+# Supported Docker endpoints:
+#   - Local Unix socket:
+#       unix:///var/run/docker.sock
+#
+#   - Remote Docker API protected by mutual TLS (recommended):
+#       tcp://docker02.example.com:2376   + certificate directory
+#
+#   - Remote Docker API without TLS (trusted networks only):
+#       tcp://docker03.example.com:2375
+#
+# Usage:
+#   watchtower-controller
+#   watchtower-controller docker-main
+#   watchtower-controller docker02
+#
+# -----------------------------------------------------------------------------
+
+BASE_DIR="${WATCHTOWER_CONTROLLER_DIR:-/opt/watchtower-controller}"
+CONFIG_DIR="${BASE_DIR}/etc"
+LOG_DIR="${BASE_DIR}/logs"
+STATE_DIR="${BASE_DIR}/state"
+
+ENV_FILE="${CONFIG_DIR}/controller.env"
+HOSTS_FILE="${CONFIG_DIR}/hosts.conf"
+
+WATCHTOWER_IMAGE="${WATCHTOWER_IMAGE:-nickfedor/watchtower:latest}"
+
+# Where Watchtower looks for ca.pem, cert.pem and key.pem inside its container.
+CONTAINER_CERT_PATH="/etc/ssl/docker"
+
+CONNECT_TIMEOUT_SECONDS=15
+LOG_RETENTION_DAYS=30
+
+LOCK_FILE="/run/watchtower-controller.lock"
+
+TARGET_HOST="${1:-}"
+
+TOTAL_HOSTS=0
+SUCCESS_HOSTS=0
+FAILED_HOSTS=0
+SKIPPED_HOSTS=0
+TARGET_FOUND=false
+
+ERRORS_LOG=""
+
+
+# -----------------------------------------------------------------------------
+# Utility functions
+# -----------------------------------------------------------------------------
+
+timestamp() {
+    date '+%Y-%m-%d %H:%M:%S'
+}
+
+
+log() {
+    echo "[$(timestamp)] $*"
+}
+
+
+log_error() {
+    local line
+    line="[$(timestamp)] ERROR: $*"
+
+    echo "${line}" >&2
+
+    # Only the controller's own errors go to errors.log: Watchtower writes its
+    # regular output to stderr too, and would flood it.
+    if [[ -n "${ERRORS_LOG}" ]]; then
+        echo "${line}" >> "${ERRORS_LOG}"
+    fi
+}
+
+
+trim() {
+    local value="$1"
+
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+
+    printf '%s' "${value}"
+}
+
+
+# -----------------------------------------------------------------------------
+# State management
+# -----------------------------------------------------------------------------
+
+write_state() {
+    local host_name="$1"
+    local docker_host="$2"
+    local status="$3"
+    local exit_code="$4"
+    local duration="$5"
+    local finished_at="$6"
+
+    local state_file="${STATE_DIR}/${host_name}.json"
+    local temp_file="${state_file}.tmp"
+
+    cat > "${temp_file}" <<EOF
+{
+  "host": "${host_name}",
+  "docker_host": "${docker_host}",
+  "status": "${status}",
+  "exit_code": ${exit_code},
+  "duration_seconds": ${duration},
+  "last_run": "${finished_at}"
+}
+EOF
+
+    mv "${temp_file}" "${state_file}"
+}
+
+
+# -----------------------------------------------------------------------------
+# Environment validation
+# -----------------------------------------------------------------------------
+
+validate_environment() {
+    if ! command -v docker >/dev/null 2>&1; then
+        log_error "Docker CLI is not installed or not available in PATH."
+        exit 1
+    fi
+
+    if ! command -v timeout >/dev/null 2>&1; then
+        log_error "The 'timeout' command is not available."
+        exit 1
+    fi
+
+    if ! command -v flock >/dev/null 2>&1; then
+        log_error "The 'flock' command is not available."
+        exit 1
+    fi
+
+    if [[ ! -f "${ENV_FILE}" ]]; then
+        log_error "Environment file not found: ${ENV_FILE}"
+        exit 1
+    fi
+
+    if [[ ! -f "${HOSTS_FILE}" ]]; then
+        log_error "Hosts file not found: ${HOSTS_FILE}"
+        exit 1
+    fi
+
+    mkdir -p "${LOG_DIR}" "${STATE_DIR}"
+}
+
+
+# -----------------------------------------------------------------------------
+# Local Docker engine
+#
+# The controller itself requires a local Docker engine because Watchtower
+# containers are created locally, even when they manage remote Docker hosts.
+# -----------------------------------------------------------------------------
+
+check_local_docker() {
+    log "Checking local Docker engine..."
+
+    if ! docker info >/dev/null 2>&1; then
+        log_error "Local Docker engine is not available."
+        exit 1
+    fi
+
+    log "Local Docker engine is available."
+}
+
+
+# -----------------------------------------------------------------------------
+# Watchtower image management
+# -----------------------------------------------------------------------------
+
+update_watchtower_image() {
+    log "Updating central Watchtower image..."
+
+    if docker pull --quiet "${WATCHTOWER_IMAGE}" >/dev/null; then
+        log "Watchtower image is up to date."
+        return 0
+    fi
+
+    log_error "Unable to pull ${WATCHTOWER_IMAGE}."
+
+    if ! docker image inspect "${WATCHTOWER_IMAGE}" >/dev/null 2>&1; then
+        log_error "No local Watchtower image is available. Aborting."
+        exit 1
+    fi
+
+    log "Continuing with the locally cached Watchtower image."
+}
+
+
+# -----------------------------------------------------------------------------
+# Docker endpoint validation
+# -----------------------------------------------------------------------------
+
+validate_docker_endpoint() {
+    local docker_host="$1"
+    local tls_dir="$2"
+
+    case "${docker_host}" in
+
+        unix://*)
+            if [[ -n "${tls_dir}" ]]; then
+                log_error "TLS certificates cannot be used with a Unix socket: ${docker_host}"
+                return 1
+            fi
+            return 0
+            ;;
+
+        tcp://*)
+            if [[ -z "${tls_dir}" ]]; then
+                return 0
+            fi
+
+            local file
+            for file in ca.pem cert.pem key.pem; do
+                if [[ ! -r "${tls_dir}/${file}" ]]; then
+                    log_error "Missing TLS file: ${tls_dir}/${file}"
+                    return 1
+                fi
+            done
+            return 0
+            ;;
+
+        *)
+            log_error "Unsupported Docker endpoint: ${docker_host}"
+            return 1
+            ;;
+
+    esac
+}
+
+
+# -----------------------------------------------------------------------------
+# Remote/local Docker client helper
+#
+# Runs a command with the docker CLI environment pointed at the given
+# endpoint, with TLS when a certificate directory is configured.
+# -----------------------------------------------------------------------------
+
+on_endpoint() {
+    local docker_host="$1"
+    local tls_dir="$2"
+    shift 2
+
+    local -a endpoint_env=("DOCKER_HOST=${docker_host}")
+
+    if [[ -n "${tls_dir}" ]]; then
+        endpoint_env+=("DOCKER_TLS_VERIFY=1" "DOCKER_CERT_PATH=${tls_dir}")
+    fi
+
+    env "${endpoint_env[@]}" "$@"
+}
+
+
+# -----------------------------------------------------------------------------
+# Remote/local Docker connectivity check
+# -----------------------------------------------------------------------------
+
+check_docker_endpoint() {
+    local docker_host="$1"
+    local tls_dir="$2"
+
+    if [[ "${docker_host}" == unix://* ]]; then
+
+        local socket_path
+        socket_path="${docker_host#unix://}"
+
+        if [[ ! -S "${socket_path}" ]]; then
+            log_error "Docker socket does not exist: ${socket_path}"
+            return 1
+        fi
+    fi
+
+    on_endpoint "${docker_host}" "${tls_dir}" \
+        timeout "${CONNECT_TIMEOUT_SECONDS}" \
+        docker version --format '{{.Server.Version}}' \
+        >/dev/null 2>&1
+}
+
+
+# -----------------------------------------------------------------------------
+# Watchtower runner
+# -----------------------------------------------------------------------------
+
+run_watchtower_container() {
+    local host_name="$1"
+    local docker_host="$2"
+    local tls_dir="$3"
+    local container_name="$4"
+
+    local -a docker_args=(
+        --rm
+        --name "${container_name}"
+        --env-file "${ENV_FILE}"
+        -e "DOCKER_HOST=${docker_host}"
+        -e "WATCHTOWER_NOTIFICATION_TITLE_TAG=${host_name}"
+    )
+
+    if [[ "${docker_host}" == unix://* ]]; then
+
+        local socket_path
+        socket_path="${docker_host#unix://}"
+
+        log "Using local Unix Docker socket: ${socket_path}"
+
+        docker_args+=(-v "${socket_path}:${socket_path}")
+
+    elif [[ -n "${tls_dir}" ]]; then
+
+        log "Using remote Docker API with mutual TLS: ${docker_host}"
+
+        docker_args+=(
+            -e "DOCKER_TLS_VERIFY=1"
+            -e "DOCKER_CERT_PATH=${CONTAINER_CERT_PATH}"
+            -v "${tls_dir}:${CONTAINER_CERT_PATH}:ro"
+        )
+
+    else
+
+        log "Using remote Docker API without TLS: ${docker_host}"
+
+    fi
+
+    docker run "${docker_args[@]}" "${WATCHTOWER_IMAGE}" --run-once
+}
+
+
+# -----------------------------------------------------------------------------
+# Host processing
+# -----------------------------------------------------------------------------
+
+run_watchtower_for_host() {
+    local host_name="$1"
+    local docker_host="$2"
+    local tls_dir="$3"
+
+    local container_name="watchtower-run-${host_name}"
+
+    local start_epoch
+    local end_epoch
+    local duration
+    local exit_code
+    local status
+    local finished_at
+
+    start_epoch="$(date +%s)"
+
+    log "------------------------------------------------------------"
+    log "Host: ${host_name}"
+    log "Docker endpoint: ${docker_host}"
+
+    if ! validate_docker_endpoint "${docker_host}" "${tls_dir}"; then
+
+        end_epoch="$(date +%s)"
+        duration=$((end_epoch - start_epoch))
+        finished_at="$(date --iso-8601=seconds)"
+
+        write_state \
+            "${host_name}" \
+            "${docker_host}" \
+            "invalid_endpoint" \
+            1 \
+            "${duration}" \
+            "${finished_at}"
+
+        return 1
+    fi
+
+    log "Checking Docker daemon connectivity..."
+
+    if ! check_docker_endpoint "${docker_host}" "${tls_dir}"; then
+
+        end_epoch="$(date +%s)"
+        duration=$((end_epoch - start_epoch))
+        finished_at="$(date --iso-8601=seconds)"
+
+        log_error "Docker daemon ${docker_host} is not reachable."
+
+        write_state \
+            "${host_name}" \
+            "${docker_host}" \
+            "unreachable" \
+            1 \
+            "${duration}" \
+            "${finished_at}"
+
+        return 1
+    fi
+
+    log "Docker daemon is reachable."
+
+    local docker_version
+
+    docker_version="$(
+        on_endpoint "${docker_host}" "${tls_dir}" \
+            docker version \
+            --format '{{.Server.Version}}' \
+            2>/dev/null || true
+    )"
+
+    if [[ -n "${docker_version}" ]]; then
+        log "Docker server version: ${docker_version}"
+    fi
+
+    log "Starting Watchtower run-once for ${host_name}..."
+
+    # Remove a stale container if a previous execution was interrupted.
+    docker rm -f "${container_name}" >/dev/null 2>&1 || true
+
+    run_watchtower_container \
+        "${host_name}" \
+        "${docker_host}" \
+        "${tls_dir}" \
+        "${container_name}"
+
+    exit_code=$?
+
+    end_epoch="$(date +%s)"
+    duration=$((end_epoch - start_epoch))
+    finished_at="$(date --iso-8601=seconds)"
+
+    if [[ ${exit_code} -eq 0 ]]; then
+
+        status="success"
+
+        log "Watchtower completed successfully for ${host_name}."
+
+    else
+
+        status="failed"
+
+        log_error \
+            "Watchtower failed for ${host_name} with exit code ${exit_code}."
+
+    fi
+
+    log "Duration: ${duration} seconds."
+
+    write_state \
+        "${host_name}" \
+        "${docker_host}" \
+        "${status}" \
+        "${exit_code}" \
+        "${duration}" \
+        "${finished_at}"
+
+    return "${exit_code}"
+}
+
+
+# -----------------------------------------------------------------------------
+# Log maintenance
+# -----------------------------------------------------------------------------
+
+cleanup_old_logs() {
+    log "Cleaning logs older than ${LOG_RETENTION_DAYS} days..."
+
+    find "${LOG_DIR}" \
+        -type f \
+        -name '*.log' \
+        ! -name 'errors.log' \
+        -mtime "+${LOG_RETENTION_DAYS}" \
+        -delete
+}
+
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+main() {
+    validate_environment
+
+    # Prevent concurrent controller executions.
+    exec 9>"${LOCK_FILE}"
+
+    if ! flock -n 9; then
+        log_error "Another Watchtower Controller instance is already running."
+        exit 1
+    fi
+
+    local run_log
+    run_log="${LOG_DIR}/$(date '+%Y-%m-%d_%H-%M-%S').log"
+
+    ERRORS_LOG="${LOG_DIR}/errors.log"
+
+    touch "${run_log}" "${ERRORS_LOG}"
+
+    # latest.log always points to the current execution log.
+    ln -sfn "$(basename "${run_log}")" "${LOG_DIR}/latest.log"
+
+    exec \
+        > >(tee -a "${run_log}") \
+        2> >(tee -a "${run_log}" >&2)
+
+    log "============================================================"
+    log "Watchtower Controller started."
+    log "============================================================"
+
+    if [[ -n "${TARGET_HOST}" ]]; then
+        log "Target host: ${TARGET_HOST}"
+    else
+        log "Target host: all enabled hosts"
+    fi
+
+    check_local_docker
+
+    update_watchtower_image
+
+    while IFS='|' read -r host_name docker_host enabled tls_dir; do
+
+        # Remove possible Windows carriage return characters.
+        enabled="${enabled//$'\r'/}"
+        tls_dir="${tls_dir//$'\r'/}"
+
+        host_name="$(trim "${host_name}")"
+        docker_host="$(trim "${docker_host}")"
+        enabled="$(trim "${enabled}")"
+        tls_dir="$(trim "${tls_dir}")"
+
+        # Ignore empty lines.
+        [[ -z "${host_name}" ]] && continue
+
+        # Ignore comments.
+        [[ "${host_name}" == \#* ]] && continue
+
+        # Validate host name because it is also used as Docker container name.
+        if [[ ! "${host_name}" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]]; then
+            log_error "Invalid host name in hosts.conf: ${host_name}"
+            FAILED_HOSTS=$((FAILED_HOSTS + 1))
+            continue
+        fi
+
+        # When a specific target is supplied, ignore all other hosts.
+        if [[ -n "${TARGET_HOST}" && "${host_name}" != "${TARGET_HOST}" ]]; then
+            continue
+        fi
+
+        if [[ "${host_name}" == "${TARGET_HOST}" ]]; then
+            TARGET_FOUND=true
+        fi
+
+        # Skip disabled hosts.
+        if [[ "${enabled}" != "true" ]]; then
+            log "Skipping disabled host: ${host_name}"
+            SKIPPED_HOSTS=$((SKIPPED_HOSTS + 1))
+            continue
+        fi
+
+        TOTAL_HOSTS=$((TOTAL_HOSTS + 1))
+
+        if run_watchtower_for_host "${host_name}" "${docker_host}" "${tls_dir}"; then
+            SUCCESS_HOSTS=$((SUCCESS_HOSTS + 1))
+        else
+            FAILED_HOSTS=$((FAILED_HOSTS + 1))
+        fi
+
+    done < "${HOSTS_FILE}"
+
+    if [[ -n "${TARGET_HOST}" && "${TARGET_FOUND}" != "true" ]]; then
+        log_error "Host '${TARGET_HOST}' was not found in ${HOSTS_FILE}."
+        exit 2
+    fi
+
+    cleanup_old_logs
+
+    log "============================================================"
+    log "Watchtower Controller completed."
+    log "Processed : ${TOTAL_HOSTS}"
+    log "Successful: ${SUCCESS_HOSTS}"
+    log "Failed    : ${FAILED_HOSTS}"
+    log "Skipped   : ${SKIPPED_HOSTS}"
+    log "============================================================"
+
+    if [[ ${FAILED_HOSTS} -gt 0 ]]; then
+        exit 1
+    fi
+
+    exit 0
+}
+
+
+main "$@"
