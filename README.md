@@ -38,6 +38,10 @@ cd watchtower-controller
 sudo ./install.sh
 ```
 
+No git on the controller? Download the archive of the [latest release](https://github.com/gioxx/watchtower-controller/releases/latest), extract it and run `sudo ./install.sh` from that folder.
+
+`sudo ./install.sh --enable` also enables and starts the daily timer. Without it the timer is installed but left off, so you can configure and test first (see [Schedule](#schedule)).
+
 Files end up in `/opt/watchtower-controller`:
 
 ```text
@@ -51,7 +55,13 @@ Files end up in `/opt/watchtower-controller`:
 └── state/               # <host>.json, outcome of the last run
 ```
 
-Running `install.sh` again updates the script and the systemd units, and never touches your configuration.
+Running `install.sh` again updates the script and the systemd units, and never touches your configuration. To update:
+
+```bash
+cd watchtower-controller
+git pull
+sudo ./install.sh
+```
 
 ## Configure
 
