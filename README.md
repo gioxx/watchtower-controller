@@ -91,7 +91,13 @@ The right way is port 2376 with mutual TLS: the daemon only accepts clients pres
 
 ## Schedule
 
-The timer runs every day at 07:00 (`Persistent=true`: if the machine was off, it runs at boot). Change `OnCalendar` with `systemctl edit watchtower-controller.timer`.
+The timer runs every day at 07:00 (`Persistent=true`: if the machine was off, it runs at boot). Change it with `systemctl edit watchtower-controller.timer`; `OnCalendar` is cumulative, so reset it before setting the new value:
+
+```ini
+[Timer]
+OnCalendar=
+OnCalendar=*-*-* 04:30:00
+```
 
 ```bash
 sudo systemctl enable --now watchtower-controller.timer   # enable
